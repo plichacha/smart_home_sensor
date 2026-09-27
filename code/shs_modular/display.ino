@@ -1,412 +1,634 @@
 // ============================================================================
-//  display.ino — ST7789 240x240 UI
-//  Lifted from the original test_wv_display sketch. Renders a static layout
-//  once (displayInit) and updates the value rows each time a new SensorPacket
-//  arrives (displayUpdate). All functions are no-ops when USE_DISPLAY is 0.
+// display.ino — Russian clock + rotating sensor cards, ST7789 240x240
+// Исправленная версия:
+//   - убрана причина сильного мерцания: больше нет полной перерисовки экрана
+//     каждую секунду/при каждом новом измерении;
+//   - часы и дата перерисовываются только при изменении минуты;
+//   - карточка датчиков обновляется отдельно;
+//   - на странице CO₂ оставлен VOC, но без длинного русского заголовка;
+//   - под показаниями выводится понятный статус «НОРМА» / «ПОВЫШЕНО» и т.п.;
+//   - «КАЛИБРОВКА» заменена на обычную человеческую оценку качества воздуха.
 // ============================================================================
+
 #include "config.h"
-#include <qrcode.h>   // Espressif QR encoder, bundled with the ESP32 core
 
 #if USE_DISPLAY
+
+#include <U8g2lib.h>
 #include <Arduino_GFX_Library.h>
+#include <qrcode.h>
+#include <time.h>
+#include <math.h>
+#include <string.h>
 
 static Arduino_DataBus *bus = new Arduino_ESP32SPI(
     PIN_LCD_DC, PIN_LCD_CS, PIN_SCLK, PIN_MOSI, PIN_MISO);
 
-// The ST7789 has a 240x320 internal framebuffer; rotations 2/3 need an 80px
-// row_offset2 to shift the visible window into the right region of that buffer.
-// It is passed unconditionally rather than only for the compiled-in rotation:
-// Arduino_TFT::setRotation() picks the right pair of offsets per rotation, so
-// supplying both is what lets the rotation change at runtime.
 static Arduino_GFX *gfx = new Arduino_ST7789(
-    bus, PIN_LCD_RST, DEFAULT_LCD_ROTATION, true /* IPS */,
-    240, 240,
-    0, 0,
-    0, 80);
+    bus, PIN_LCD_RST, DEFAULT_LCD_ROTATION, true,
+    240, 240, 0, 0, 0, 80);
 
-#define BG_COLOR    RGB565(0x10, 0x18, 0x20)
-#define TITLE_COLOR RGB565(0xFF, 0xD1, 0x66)
-#define LABEL_COLOR RGB565(0x9F, 0xB6, 0xCD)
-#define VALUE_COLOR 0xFFFF
-#define OK_COLOR    RGB565(0x06, 0xD6, 0xA0)
-#define WARN_COLOR  RGB565(0xFF, 0xD1, 0x66)
-#define ERR_COLOR   RGB565(0xEF, 0x47, 0x6F)
-// QR codes need a light background and dark modules; scanners cope badly with
-// the inverse, so this screen deliberately breaks the dark theme.
-#define WHITE_BG    0xFFFF
-#define QR_DARK     0x0000
-#define QR_TEXT     RGB565(0x33, 0x33, 0x33)
+// -----------------------------------------------------------------------------
+// Цвета
+// -----------------------------------------------------------------------------
+#define BG_COLOR      RGB565(0x0B, 0x11, 0x18)
+#define CARD_COLOR    RGB565(0x14, 0x1E, 0x28)
+#define TEXT_COLOR    RGB565(0xF4, 0xF7, 0xFA)
+#define MUTED_COLOR   RGB565(0x92, 0xA4, 0xB5)
+#define ACCENT_COLOR  RGB565(0x72, 0xD6, 0xC2)
+#define WARN_COLOR    RGB565(0xFF, 0xC8, 0x66)
+#define BAD_COLOR     RGB565(0xFF, 0x77, 0x77)
+#define WHITE_BG      0xFFFF
+#define QR_DARK       0x0000
+#define QR_TEXT       RGB565(0x33, 0x33, 0x33)
 
-// ---------- Display layout (240x240) ----------
-// Six value rows + a title/status header and a footer.
-// Labels are left-aligned at LABEL_X; values are right-aligned to the screen
-// edge. The top-right corner (x >= CONN_X) is reserved for WiFi + MQ icons.
-#define LABEL_X     10
-#define VAL_CLEAR_X 84      // value area (cleared + right-aligned) starts here
-#define ROW_IAQ     38
-#define ROW_CO2     68
-#define ROW_VOC     98
-#define ROW_TEMP    128
-#define ROW_HUM     158
-#define ROW_PRES    188
-#define FOOTER_Y    216
-
-// ---------- Setup screen grid ----------
-// Four identical fields: an 8 px caption with a 16 px value 12 px below it,
-// on a 42 px pitch. Ends at 198, clear of the footer status line at 216.
-#define PORTAL_ROW1  44
-#define PORTAL_ROW2  86
-#define PORTAL_ROW3 128
-#define PORTAL_ROW4 170
-#define PORTAL_VALUE_DY 12
-#define PORTAL_FIELD_H  28
-
-// Connection status area (top-right corner, x >= CONN_X): [label][WiFi icon].
-// The label sits to the LEFT of the icon and is right-aligned against it, so a
-// two-character label ("MQ") and a three-character one ("API") both fit without
-// colliding with the icon or running off the 240 px edge. Icon radius 14
-// matches textSize(2) height (16 px); cy=22 puts its top at y=8, level with the
-// device name.
-#define WIFI_R       14
-#define WIFI_CX     221     // icon spans 207..235, leaving a 4 px right margin
-#define WIFI_CY      22
-#define ICON_LEFT   (WIFI_CX - WIFI_R)
-#define LABEL_GAP     6     // between label and icon
-#define CHAR_W2      12     // advance per char at textSize(2)
-#define CONN_X      160     // left edge of the reserved band (fits "API" + icon)
-#define MQ_Y          8     // label y — top-aligned with the device name
-
-static bool     wifiOk    = false;
-static int8_t   linkState = -1;   // -1 not tried, 0 failed, 1 ok
-static bool     blinkOn   = true;
+// -----------------------------------------------------------------------------
+// Состояние
+// -----------------------------------------------------------------------------
+static bool wifiOk = false;
+static bool blinkOn = true;
 static uint32_t lastBlink = 0;
 
-// WiFi icon: three concentric rings (2 px wide, 2 px gap) + centre dot,
-// clipped to a 90° wedge (45° each side of vertical) opening upward.
-// Radius 14 matches textSize(2) height so the icon sits at the same scale as
-// the device name and the "MQ" label beside it.
-static void drawWifiIcon(uint16_t color) {
-  // Build rings outside-in: fillCircle(BG) carves each gap, fillCircle(color)
-  // restores the next ring. Result: rings at r 3-5, 7-9, 11-14; gaps at 1-3, 5-7, 9-11.
-  gfx->fillCircle(WIFI_CX, WIFI_CY, WIFI_R, color);
-  gfx->fillCircle(WIFI_CX, WIFI_CY, 11, BG_COLOR);
-  gfx->fillCircle(WIFI_CX, WIFI_CY,  9, color);
-  gfx->fillCircle(WIFI_CX, WIFI_CY,  7, BG_COLOR);
-  gfx->fillCircle(WIFI_CX, WIFI_CY,  5, color);
-  gfx->fillCircle(WIFI_CX, WIFI_CY,  3, BG_COLOR);
-  gfx->fillCircle(WIFI_CX, WIFI_CY,  1, color);    // centre dot
+static bool screenLocked = false;
+static uint32_t screenUnlockAt = 0;
 
-  // Clip outside the 90° wedge. tan(45°) = 1, so the wedge edge lands exactly
-  // r px horizontally from cx — the clipping triangles are perfect right triangles.
-  const int16_t cx = WIFI_CX, cy = WIFI_CY;
-  gfx->fillTriangle(cx, cy, cx-15, cy-15, cx-15, cy, BG_COLOR); // left
-  gfx->fillTriangle(cx, cy, cx+15, cy-15, cx+15, cy, BG_COLOR); // right
-  gfx->fillRect(cx-15, cy+1, 31, 15, BG_COLOR);                  // below dot
+static SensorPacket latestPacket;
+static bool havePacket = false;
+
+static uint8_t page = 0;
+static uint32_t lastPageChange = 0;
+static const uint32_t PAGE_MS = 5000;
+static const uint8_t PAGE_COUNT = 4;
+
+// Время последней отрисованной минуты.
+static int lastDrawnMinute = -1;
+static bool forceClockRedraw = true;
+
+// Обновление данных карточки — не чаще раза в секунду.
+static uint32_t lastCardRedraw = 0;
+static bool forceCardRedraw = true;
+
+// U8g2 fonts: Cyrillic for Russian text, numeric font for the large clock.
+static const uint8_t *FONT_RU      = u8g2_font_8x13_t_cyrillic;
+static const uint8_t *FONT_RU_BIG  = u8g2_font_10x20_t_cyrillic;
+static const uint8_t *FONT_CLOCK   = u8g2_font_logisoso42_tn;
+
+// -----------------------------------------------------------------------------
+// Оценки
+// -----------------------------------------------------------------------------
+static uint16_t iaqColor(float v) {
+  if (isnan(v)) return MUTED_COLOR;
+  if (v <= 50)  return ACCENT_COLOR;
+  if (v <= 100) return RGB565(0xA8, 0xD8, 0x3A);
+  if (v <= 150) return WARN_COLOR;
+  if (v <= 200) return RGB565(0xFF, 0x9F, 0x40);
+  return BAD_COLOR;
 }
 
-// Label for the backend indicator beside the WiFi icon. The display-only build
-// has no backend, so it gets no label at all rather than a permanently red one.
-#if USE_MQTT
-  #define LINK_LABEL "MQ"
-#elif USE_SENSORBOARD
-  #define LINK_LABEL "API"
-#else
-  #define LINK_LABEL nullptr
-#endif
-
-// Redraw the entire connection status corner (WiFi icon + backend label).
-static void drawConnStatus() {
-  gfx->fillRect(CONN_X, 0, 240 - CONN_X, 32, BG_COLOR);
-
-  // WiFi icon — hidden during blink-off phase while disconnected
-  if (wifiOk || blinkOn)
-    drawWifiIcon(wifiOk ? OK_COLOR : ERR_COLOR);
-
-  const char *label = LINK_LABEL;
-  if (!label) return;
-
-  // linkState is deliberately tri-state. The device only contacts the backend
-  // every few minutes, so a boolean would have to start as "failed" and sit
-  // there in red for the whole first interval, reporting a failure that has not
-  // happened. Grey means "not tried yet".
-  uint16_t color = linkState < 0 ? LABEL_COLOR : (linkState ? OK_COLOR : ERR_COLOR);
-  gfx->setTextSize(2);
-  gfx->setTextColor(color);
-  // Right-align against the icon, whatever the label's length.
-  gfx->setCursor(ICON_LEFT - LABEL_GAP - (int16_t)(strlen(label) * CHAR_W2), MQ_Y);
-  gfx->print(label);
+static uint16_t co2Color(float v) {
+  if (isnan(v)) return MUTED_COLOR;
+  if (v <= 800)  return ACCENT_COLOR;
+  if (v <= 1000) return RGB565(0xA8, 0xD8, 0x3A);
+  if (v <= 1500) return WARN_COLOR;
+  if (v <= 2000) return RGB565(0xFF, 0x9F, 0x40);
+  return BAD_COLOR;
 }
 
-static void drawStaticUI() {
-  gfx->fillScreen(BG_COLOR);
+// Упрощённая бытовая шкала для экрана.
+// Это именно UI-оценка, а не отдельный датчик качества воздуха.
+static const char *iaqText(float v) {
+  if (isnan(v)) return "нет данных";
+  if (v <= 50)  return "ИДЕАЛЬНО";
+  if (v <= 100) return "ХОРОШО";
+  if (v <= 150) return "НОРМА";
+  if (v <= 200) return "ПЛОХО";
+  return "УЖАСНО";
+}
+
+static const char *co2Text(float v) {
+  if (isnan(v)) return "нет данных";
+  if (v <= 1000) return "НОРМА";
+  if (v <= 1500) return "ПОВЫШЕНО";
+  return "ПЛОХО";
+}
+
+// VOC — это Breath VOC equivalent из BSEC. Для простого интерфейса используем
+// мягкую трёхступенчатую оценку; сами численные показания VOC не меняются.
+static const char *vocText(float v) {
+  if (isnan(v)) return "нет данных";
+  if (v <= 1.0f) return "НОРМА";
+  if (v <= 3.0f) return "ПОВЫШЕНО";
+  return "ПЛОХО";
+}
+
+// -----------------------------------------------------------------------------
+// Шрифты / текст
+// -----------------------------------------------------------------------------
+static void setRuFont(bool big = false) {
+  gfx->setFont(big ? FONT_RU_BIG : FONT_RU);
+  gfx->setUTF8Print(true);
   gfx->setTextWrap(false);
-
-  // Device name — may be overwritten at right edge by drawConnStatus() below
-  gfx->setTextColor(TITLE_COLOR);
-  gfx->setTextSize(2);
-  gfx->setCursor(LABEL_X, 8);
-  gfx->print(settings.deviceName);
-
-  // Connection status (clears x >= CONN_X and draws icons over any title overflow)
-  drawConnStatus();
-
-  // Row labels
-  gfx->setTextSize(2);
-  gfx->setTextColor(LABEL_COLOR);
-  gfx->setCursor(LABEL_X, ROW_IAQ);  gfx->print("IAQ");
-  gfx->setCursor(LABEL_X, ROW_CO2);  gfx->print("CO2");
-  gfx->setCursor(LABEL_X, ROW_VOC);  gfx->print("VOC");
-  gfx->setCursor(LABEL_X, ROW_TEMP); gfx->print("Temp");
-  gfx->setCursor(LABEL_X, ROW_HUM);  gfx->print("Hum");
-  gfx->setCursor(LABEL_X, ROW_PRES); gfx->print("Press");
 }
 
-// Right-align a value string to the screen edge on its row.
-static void drawValue(int16_t y, const char *value, uint16_t color) {
-  gfx->fillRect(VAL_CLEAR_X, y, 240 - VAL_CLEAR_X, 18, BG_COLOR);
-  gfx->setTextSize(2);
+static void setClockFont() {
+  gfx->setFont(FONT_CLOCK);
+  gfx->setUTF8Print(false);
+  gfx->setTextWrap(false);
+}
+
+static void centeredText(const char *s, int16_t y, uint16_t color) {
+  int16_t x1, y1;
+  uint16_t w, h;
+
+  gfx->getTextBounds(s, 0, y, &x1, &y1, &w, &h);
   gfx->setTextColor(color);
-  int16_t x1, y1; uint16_t w, h;
+  gfx->setCursor((240 - (int16_t)w) / 2, y);
+  gfx->print(s);
+}
+
+// -----------------------------------------------------------------------------
+// Wi-Fi
+// -----------------------------------------------------------------------------
+static void drawWifiIcon(uint16_t color) {
+  const int16_t cx = 218;
+  const int16_t cy = 17;
+
+  gfx->fillCircle(cx, cy, 9, color);
+  gfx->fillCircle(cx, cy, 7, BG_COLOR);
+  gfx->fillCircle(cx, cy, 5, color);
+  gfx->fillCircle(cx, cy, 3, BG_COLOR);
+  gfx->fillCircle(cx, cy, 1, color);
+
+  gfx->fillRect(cx - 10, cy + 1, 21, 9, BG_COLOR);
+  gfx->fillTriangle(cx, cy, cx - 11, cy - 11, cx - 11, cy, BG_COLOR);
+  gfx->fillTriangle(cx, cy, cx + 11, cy - 11, cx + 11, cy, BG_COLOR);
+}
+
+static void drawTopStatus() {
+  gfx->fillRect(194, 0, 46, 30, BG_COLOR);
+  if (wifiOk || blinkOn) {
+    drawWifiIcon(wifiOk ? ACCENT_COLOR : BAD_COLOR);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Часы / дата
+// -----------------------------------------------------------------------------
+static bool getClockText(char *buf, size_t n) {
+  struct tm tmNow;
+
+  if (!getLocalTime(&tmNow, 20)) {
+    snprintf(buf, n, "--:--");
+    return false;
+  }
+
+  tmNow.tm_hour = (tmNow.tm_hour + 2) % 24;
+
+  strftime(buf, n, "%H:%M", &tmNow);
+  return true;
+}
+
+static void drawClockArea() {
+  // Очищаем только верхнюю часть, а не весь экран.
+  gfx->fillRect(0, 0, 240, 99, BG_COLOR);
+
+  char t[8];
+  bool valid = getClockText(t, sizeof(t));
+
+  setClockFont();
+  gfx->setTextColor(valid ? TEXT_COLOR : MUTED_COLOR);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  gfx->getTextBounds(t, 0, 64, &x1, &y1, &w, &h);
+  gfx->setCursor((240 - (int16_t)w) / 2, 66);
+  gfx->print(t);
+
+  struct tm tmNow;
+
+  if (getLocalTime(&tmNow, 5)) {
+    static const char *days[] = {
+      "воскресенье",
+      "понедельник",
+      "вторник",
+      "среда",
+      "четверг",
+      "пятница",
+      "суббота"
+    };
+
+    char date[40];
+    snprintf(date, sizeof(date), "%s, %02d.%02d.%04d",
+             days[tmNow.tm_wday], tmNow.tm_mday,
+             tmNow.tm_mon + 1, tmNow.tm_year + 1900);
+
+    setRuFont(false);
+    centeredText(date, 86, MUTED_COLOR);
+
+    lastDrawnMinute = tmNow.tm_min;
+  } else {
+    setRuFont(false);
+    centeredText("нет времени — проверьте Wi-Fi", 86, MUTED_COLOR);
+    lastDrawnMinute = -1;
+  }
+
+  forceClockRedraw = false;
+}
+
+static void drawClockIfNeeded() {
+  if (forceClockRedraw) {
+    drawClockArea();
+    return;
+  }
+
+  struct tm tmNow;
+  if (!getLocalTime(&tmNow, 5)) {
+    if (lastDrawnMinute != -1) {
+      drawClockArea();
+    }
+    return;
+  }
+
+  if (tmNow.tm_min != lastDrawnMinute) {
+    drawClockArea();
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Карточки
+// -----------------------------------------------------------------------------
+static void drawCardShell(const char *title, uint16_t accent) {
+  gfx->fillRoundRect(8, 100, 224, 128, 16, CARD_COLOR);
+  gfx->fillRoundRect(8, 100, 6, 128, 3, accent);
+
+  setRuFont(true);
+  gfx->setTextColor(accent);
+  gfx->setCursor(24, 124);
+  gfx->print(title);
+}
+
+static void drawBigValue(const char *value, const char *unit, uint16_t color) {
+  setClockFont();
+  gfx->setTextColor(color);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  gfx->getTextBounds(value, 0, 174, &x1, &y1, &w, &h);
+
+  int16_t x = 120 - (int16_t)w / 2 - (unit[0] ? 10 : 0);
+  gfx->setCursor(x, 174);
+  gfx->print(value);
+
+  if (unit[0]) {
+    setRuFont(false);
+    gfx->setTextColor(MUTED_COLOR);
+    gfx->setCursor(x + w + 8, 171);
+    gfx->print(unit);
+  }
+}
+
+static void drawStatusLine(const char *label, const char *value, uint16_t color,
+                           int16_t y = 214) {
+  setRuFont(false);
+
+  if (label && label[0]) {
+    gfx->setTextColor(MUTED_COLOR);
+    gfx->setCursor(24, y);
+    gfx->print(label);
+  }
+
+  gfx->setTextColor(color);
+  int16_t x1, y1;
+  uint16_t w, h;
   gfx->getTextBounds(value, 0, y, &x1, &y1, &w, &h);
-  gfx->setCursor(240 - w - 6, y);
+  gfx->setCursor(216 - w, y);
   gfx->print(value);
 }
 
-// IAQ band colors (0-50 good ... >300 severe), per BSEC's IAQ scale.
-static uint16_t iaqColor(float iaq) {
-  if (iaq <= 50)  return RGB565(0x06, 0xD6, 0xA0);  // good        - green
-  if (iaq <= 100) return RGB565(0xA8, 0xD8, 0x3A);  // moderate    - lime
-  if (iaq <= 150) return RGB565(0xFF, 0xD1, 0x66);  // light poll. - amber
-  if (iaq <= 200) return RGB565(0xFF, 0x9F, 0x40);  // moderate p. - orange
-  if (iaq <= 300) return RGB565(0xEF, 0x47, 0x6F);  // heavy poll. - red
-  return RGB565(0xB5, 0x17, 0x9E);                  // severe      - magenta
+static void drawCard() {
+  char a[24];
+  char b[32];
+
+  switch (page) {
+    case 0: {
+      drawCardShell("Качество воздуха", iaqColor(latestPacket.iaq));
+
+      if (!havePacket || isnan(latestPacket.iaq)) {
+        drawBigValue("--", "", MUTED_COLOR);
+        drawStatusLine("статус", "нет данных", MUTED_COLOR);
+      } else {
+        snprintf(a, sizeof(a), "%.0f", latestPacket.iaq);
+        drawBigValue(a, "IAQ", iaqColor(latestPacket.iaq));
+        drawStatusLine("оценка", iaqText(latestPacket.iaq),
+                       iaqColor(latestPacket.iaq));
+      }
+      break;
+    }
+
+    case 1: {
+      drawCardShell("Температура и влажность", ACCENT_COLOR);
+
+      if (!havePacket || isnan(latestPacket.temperature)) {
+        drawBigValue("--", "°C", MUTED_COLOR);
+      } else {
+        snprintf(a, sizeof(a), "%.1f", latestPacket.temperature);
+        drawBigValue(a, "°C", TEXT_COLOR);
+      }
+
+      if (!havePacket || isnan(latestPacket.humidity)) {
+        snprintf(b, sizeof(b), "-- %%");
+      } else {
+        snprintf(b, sizeof(b), "%.0f %%", latestPacket.humidity);
+      }
+
+      drawStatusLine("влажность", b, TEXT_COLOR);
+      break;
+    }
+
+    case 2: {
+      // Важно: оставляем VOC, но НЕ пишем длинную русскую надпись
+      // «летучие вещества» сверху. Заголовок только CO₂.
+      drawCardShell("CO2", co2Color(latestPacket.co2));
+
+      if (!havePacket || isnan(latestPacket.co2)) {
+        drawBigValue("--", "ppm", MUTED_COLOR);
+        drawStatusLine("CO2", "нет данных", MUTED_COLOR, 198);
+      } else {
+        snprintf(a, sizeof(a), "%.0f", latestPacket.co2);
+        drawBigValue(a, "ppm", co2Color(latestPacket.co2));
+        drawStatusLine("CO2", co2Text(latestPacket.co2),
+                       co2Color(latestPacket.co2), 198);
+      }
+
+      // VOC остаётся отдельной строкой внизу карточки.
+      // Статус выводим рядом с VOC, чтобы он не пересекался с основным числом.
+      if (!havePacket || isnan(latestPacket.voc)) {
+        snprintf(b, sizeof(b), "--");
+        drawStatusLine("VOC", b, MUTED_COLOR, 220);
+      } else {
+        snprintf(b, sizeof(b), "%.1f %s", latestPacket.voc, vocText(latestPacket.voc));
+        uint16_t vocColor = latestPacket.voc <= 1.0f
+                              ? ACCENT_COLOR
+                              : (latestPacket.voc <= 3.0f ? WARN_COLOR : BAD_COLOR);
+        drawStatusLine("VOC", b, vocColor, 220);
+      }
+      break;
+    }
+
+    default: {
+      drawCardShell("Давление", ACCENT_COLOR);
+
+      if (!havePacket || isnan(latestPacket.pressure)) {
+        drawBigValue("----", "hPa", MUTED_COLOR);
+      } else {
+        snprintf(a, sizeof(a), "%.0f", latestPacket.pressure);
+        drawBigValue(a, "hPa", TEXT_COLOR);
+      }
+
+      drawStatusLine("статус", "НОРМА", ACCENT_COLOR);
+      break;
+    }
+  }
+
+  // Индикатор текущей страницы.
+  for (uint8_t i = 0; i < PAGE_COUNT; ++i) {
+    uint16_t c = (i == page) ? TEXT_COLOR : RGB565(0x45, 0x55, 0x65);
+    gfx->fillCircle(102 + i * 12, 236, (i == page) ? 3 : 2, c);
+  }
+
+  forceCardRedraw = false;
+  lastCardRedraw = millis();
 }
 
-// CO2-equivalent band colors (ppm). ~400 = outdoor air, 1000 is the common
-// indoor "ventilate" threshold, >2000 is clearly stuffy.
-static uint16_t co2Color(float co2) {
-  if (co2 <= 800)  return RGB565(0x06, 0xD6, 0xA0);  // fresh    - green
-  if (co2 <= 1000) return RGB565(0xA8, 0xD8, 0x3A);  // good     - lime
-  if (co2 <= 1500) return RGB565(0xFF, 0xD1, 0x66);  // moderate - amber
-  if (co2 <= 2000) return RGB565(0xFF, 0x9F, 0x40);  // poor     - orange
-  return RGB565(0xEF, 0x47, 0x6F);                   // bad      - red
+static void drawFullPage() {
+  gfx->fillScreen(BG_COLOR);
+  drawClockArea();
+  drawTopStatus();
+  drawCard();
 }
 
-// While the setup portal owns the screen, readings must not paint over it. The
-// portal keeps BSEC running on purpose, so the callbacks continue to arrive;
-// they are dropped here rather than at the source, which keeps the sensor's
-// timing untouched and the suppression in one place.
-// The portal and the QR screen both take the display over. The portal holds it
-// until setup finishes; the QR releases itself after a deadline. Readings are
-// dropped while either owns it, rather than pausing the sensor: the portal
-// keeps BSEC sampling on purpose, since its calibration clock must not stall.
-static bool     screenLocked  = false;
-static uint32_t screenUnlockAt = 0;   // 0 = held until released explicitly
+static void redrawCardIfNeeded(bool force = false) {
+  const uint32_t now = millis();
+  if (!force && !forceCardRedraw && now - lastCardRedraw < 1000) return;
 
-// Footer writer used by the portal view itself, which must bypass the latch.
+  // Меняем только область карточки. Верхняя часть с часами не трогается.
+  gfx->fillRect(0, 99, 240, 141, BG_COLOR);
+  drawCard();
+}
+
+// -----------------------------------------------------------------------------
+// Public display API
+// -----------------------------------------------------------------------------
 static void drawStatus(const char *msg, uint16_t color) {
-  gfx->fillRect(0, FOOTER_Y - 2, 240, 24, BG_COLOR);
-  gfx->setTextSize(2);
-  gfx->setTextColor(color);
-  gfx->setCursor(LABEL_X, FOOTER_Y);
-  gfx->print(msg);
+  gfx->fillRect(0, 100, 240, 140, BG_COLOR);
+  setRuFont(true);
+  centeredText(msg, 145, color);
 }
-
-// ---- Public API (called from setup, bme680.ino, wifi.ino, mqtt.ino) --------
 
 void displayInit() {
   pinMode(PIN_BL, OUTPUT);
   digitalWrite(PIN_BL, HIGH);
-  if (!gfx->begin()) Serial.println("gfx->begin() failed");
+
+  if (!gfx->begin()) {
+    Serial.println("gfx->begin() failed");
+  }
+
   gfx->setRotation(settings.lcdRotation & 0x03);
-  drawStaticUI();
+  gfx->setTextWrap(false);
+
+  latestPacket = SensorPacket();
+  havePacket = false;
+  page = 0;
+  lastPageChange = millis();
+  lastCardRedraw = 0;
+  forceClockRedraw = true;
+  forceCardRedraw = true;
+  lastDrawnMinute = -1;
+
+  drawFullPage();
 }
 
-// Footer status line (e.g. "Stabilizing", "Calibrated", error messages).
 void displayStatus(const char *msg, uint16_t color) {
   if (screenLocked) return;
   drawStatus(msg, color);
 }
 
-// Map BSEC IAQ accuracy (0..3) to a short status string + color.
 void displayAccuracy(uint8_t accuracy) {
-  if (screenLocked) return;
-  switch (accuracy) {
-    case 0:  displayStatus("Stabilizing", COLOR_INFO); break;
-    case 1:  displayStatus("Calibrating (1)", COLOR_WARN); break;
-    case 2:  displayStatus("Calibrating (2)", COLOR_WARN); break;
-    default: displayStatus("Calibrated", COLOR_OK); break;
+  // Отдельно не рисуем: пользовательский интерфейс показывает обычную
+  // человеческую оценку IAQ вместо слова «калибровка».
+  (void)accuracy;
+}
+
+void displayUpdate(const SensorPacket &p) {
+  latestPacket = p;
+  havePacket = true;
+}
+
+void displayNoSensor() {
+  latestPacket = SensorPacket();
+  havePacket = false;
+  forceCardRedraw = true;
+}
+
+void displaySetWifiStatus(bool connected) {
+  if (wifiOk == connected) return;
+
+  wifiOk = connected;
+  blinkOn = true;
+
+  if (!screenLocked) {
+    drawTopStatus();
   }
 }
 
-// Redraw all value rows from the latest packet.
-void displayUpdate(const SensorPacket &p) {
-  if (screenLocked) return;
-  char buf[24];
-  displayAccuracy(p.iaqAccuracy);
-
-  if (!isnan(p.iaq))         { snprintf(buf, sizeof(buf), "%.0f", p.iaq);            drawValue(ROW_IAQ,  buf, iaqColor(p.iaq)); }
-  if (!isnan(p.co2))         { snprintf(buf, sizeof(buf), "%.0f ppm", p.co2);        drawValue(ROW_CO2,  buf, co2Color(p.co2)); }
-  if (!isnan(p.voc))         { snprintf(buf, sizeof(buf), "%.1f ppm", p.voc);        drawValue(ROW_VOC,  buf, VALUE_COLOR); }
-  if (!isnan(p.temperature)) { snprintf(buf, sizeof(buf), "%.1f C", p.temperature);  drawValue(ROW_TEMP, buf, VALUE_COLOR); }
-  if (!isnan(p.humidity))    { snprintf(buf, sizeof(buf), "%.1f %%", p.humidity);    drawValue(ROW_HUM,  buf, VALUE_COLOR); }
-  if (!isnan(p.pressure))    { snprintf(buf, sizeof(buf), "%.1f hPa", p.pressure);   drawValue(ROW_PRES, buf, VALUE_COLOR); }
-}
-
-// Show placeholder dashes when the sensor failed to initialise.
-void displayNoSensor() {
-  if (screenLocked) return;
-  drawValue(ROW_IAQ,  "---",      LABEL_COLOR);
-  drawValue(ROW_CO2,  "--- ppm",  LABEL_COLOR);
-  drawValue(ROW_VOC,  "--- ppm",  LABEL_COLOR);
-  drawValue(ROW_TEMP, "--.- C",   LABEL_COLOR);
-  drawValue(ROW_HUM,  "--.- %",   LABEL_COLOR);
-  drawValue(ROW_PRES, "---- hPa", LABEL_COLOR);
-}
-
-// Called after Wi-Fi connects or drops.
-void displaySetWifiStatus(bool connected) {
-  if (screenLocked) return;
-  if (wifiOk == connected) return;
-  wifiOk = connected;
-  if (connected) blinkOn = true;
-  drawConnStatus();
-}
-
-// Called after MQTT connects or disconnects.
 void displaySetMqttStatus(bool connected) {
-  int8_t next = connected ? 1 : 0;
-  if (next == linkState) return;
-  linkState = next;
-  if (screenLocked) return;
-  drawConnStatus();
+  // Основной UI показывает состояние Wi-Fi; MQTT остаётся виден в Home Assistant.
+  (void)connected;
 }
 
-// Drive the WiFi blink animation. Call from loop() — no-op when Wi-Fi is up.
 void displayTick() {
-  if (screenLocked) {
-    if (screenUnlockAt && (int32_t)(millis() - screenUnlockAt) >= 0) displayResume();
+   if (screenLocked) {
+    if (screenUnlockAt &&
+        (int32_t)(millis() - screenUnlockAt) >= 0) {
+      displayResume();
+    }
     return;
   }
-  if (wifiOk) return;
-  uint32_t now = millis();
-  if (now - lastBlink < 500) return;
-  lastBlink = now;
-  blinkOn = !blinkOn;
-  drawConnStatus();
+
+  const uint32_t now = millis();
+
+  // Переключаем карточку примерно раз в 5 секунд.
+  if (now - lastPageChange >= PAGE_MS) {
+    lastPageChange = now;
+    page = (page + 1) % PAGE_COUNT;
+
+    // Только здесь происходит перерисовка карточки.
+    redrawCardIfNeeded(true);
+  }
+
+  // Часы обновляются только при смене минуты.
+  drawClockIfNeeded();
+
+  if (!wifiOk && now - lastBlink >= 500) {
+    lastBlink = now;
+    blinkOn = !blinkOn;
+    drawTopStatus();
+  }
 }
 
-// Full-screen commissioning view. The AP name and the device ID are the two
-// things a student needs while the portal is open, and they are needed exactly
-// when the device has no other way to tell them — no network, no dashboard.
-// One setup-screen field: a small caption with the value on the line below.
-// Every field on the screen is drawn through this, so they share one grid
-// rather than each carrying its own offsets.
-static void drawPortalField(int16_t y, const char *caption,
-                            const char *value, uint16_t color) {
-  gfx->fillRect(0, y, 240, PORTAL_FIELD_H, BG_COLOR);
-  gfx->setTextSize(1);
-  gfx->setTextColor(LABEL_COLOR);
-  gfx->setCursor(LABEL_X, y);
+// -----------------------------------------------------------------------------
+// Setup portal
+// -----------------------------------------------------------------------------
+static void drawPortalField(
+  int16_t y,
+  const char *caption,
+  const char *value,
+  uint16_t color
+) {
+  gfx->fillRect(0, y, 240, 38, BG_COLOR);
+
+  setRuFont(false);
+  gfx->setTextColor(MUTED_COLOR);
+  gfx->setCursor(12, y + 11);
   gfx->print(caption);
-  gfx->setTextSize(2);
+
+  setRuFont(true);
   gfx->setTextColor(color);
-  gfx->setCursor(LABEL_X, y + PORTAL_VALUE_DY);
+  gfx->setCursor(12, y + 31);
   gfx->print(value);
 }
 
 void displayPortal(const char *apName, const char *deviceId) {
   screenLocked = true;
   screenUnlockAt = 0;
+
   gfx->fillScreen(BG_COLOR);
-  gfx->setTextWrap(false);
 
-  gfx->setTextColor(TITLE_COLOR);
-  gfx->setTextSize(2);
-  gfx->setCursor(LABEL_X, 10);
-  gfx->print("Setup mode");
+  setRuFont(true);
+  gfx->setTextColor(TEXT_COLOR);
+  gfx->setCursor(12, 24);
+  gfx->print("Настройка");
 
-  drawPortalField(PORTAL_ROW1, "Join this WiFi network:", apName,       COLOR_OK);
-  drawPortalField(PORTAL_ROW2, "Then open:",              "192.168.4.1", VALUE_COLOR);
-  drawPortalField(PORTAL_ROW3, "Device ID:",              deviceId,      VALUE_COLOR);
-  displayPortalSensor("checking...", COLOR_INFO);
+  drawPortalField(34,  "Wi-Fi сеть:", apName, ACCENT_COLOR);
+  drawPortalField(74,  "Откройте:", "192.168.4.1", TEXT_COLOR);
+  drawPortalField(114, "ID устройства:", deviceId, TEXT_COLOR);
+  displayPortalSensor("проверка...", COLOR_INFO);
 
-  drawStatus("Waiting for setup", COLOR_INFO);
+  setRuFont(false);
+  gfx->setTextColor(MUTED_COLOR);
+  gfx->setCursor(12, 226);
+  gfx->print("Подключитесь к сети с экрана");
 }
 
-// Sensor line on the setup screen. Bypasses the overlay latch by design: this
-// is part of the setup view, not a reading painted over it.
 void displayPortalSensor(const char *msg, uint16_t color) {
-  if (!screenLocked) return;          // only meaningful while setup owns the screen
-  drawPortalField(PORTAL_ROW4, "BME680 sensor:", msg, color);
+  if (!screenLocked) return;
+  drawPortalField(154, "Датчик BME680:", msg, color);
 }
 
-// Full-screen QR code, released automatically after showMs by displayTick().
-// Scanning it is the shortest path from a board on the table to that board's
-// dashboard on a phone; typing the device ID by hand is the alternative.
-// esp_qrcode_generate() hands the finished code to a plain function pointer
-// with no user context, so the rendering lives in this callback and needs
-// nothing but the handle.
+// -----------------------------------------------------------------------------
+// QR screen
+// -----------------------------------------------------------------------------
 static void drawQrCallback(esp_qrcode_handle_t qr) {
   int size = esp_qrcode_get_size(qr);
   if (size <= 0) return;
 
-  gfx->fillScreen(WHITE_BG);   // scanners need a light quiet zone
+  gfx->fillScreen(WHITE_BG);
 
-  const int16_t header = 22;
-  int16_t avail = 240 - header - 8;
-  int16_t scale = avail / size;          // whole pixels per module, or it blurs
+  const int16_t header = 24;
+  const int16_t avail = 240 - header - 8;
+  const int16_t scale = avail / size;
+
   if (scale < 1) return;
-  int16_t dim = size * scale;
-  int16_t ox  = (240 - dim) / 2;
-  int16_t oy  = header + (avail - dim) / 2;
 
-  gfx->setTextSize(1);
+  const int16_t dim = size * scale;
+  const int16_t ox = (240 - dim) / 2;
+  const int16_t oy = header + (avail - dim) / 2;
+
+  setRuFont(false);
   gfx->setTextColor(QR_TEXT);
-  gfx->setCursor(LABEL_X, 8);
-  gfx->print("Scan for your dashboard");
+  gfx->setCursor(10, 16);
+  gfx->print("Откройте камеру");
 
   for (int y = 0; y < size; y++) {
     for (int x = 0; x < size; x++) {
       if (esp_qrcode_get_module(qr, x, y)) {
-        gfx->fillRect(ox + x * scale, oy + y * scale, scale, scale, QR_DARK);
+        gfx->fillRect(ox + x * scale, oy + y * scale,
+                      scale, scale, QR_DARK);
       }
     }
   }
 }
 
 void displayQr(const char *url, uint32_t showMs) {
-  screenLocked   = true;
+  screenLocked = true;
   screenUnlockAt = millis() + showMs;
-  if (screenUnlockAt == 0) screenUnlockAt = 1;   // 0 means "held indefinitely"
+
+  if (screenUnlockAt == 0) screenUnlockAt = 1;
 
   esp_qrcode_config_t cfg = {
-    .display_func       = drawQrCallback,
-    // Version 5 is 37x37 modules: 6 whole pixels each on a 240 px screen, and
-    // room for a dashboard URL. Higher versions scan worse at this size.
+    .display_func = drawQrCallback,
     .max_qrcode_version = 5,
-    .qrcode_ecc_level   = ESP_QRCODE_ECC_LOW,
+    .qrcode_ecc_level = ESP_QRCODE_ECC_LOW,
   };
+
   if (esp_qrcode_generate(&cfg, url) != ESP_OK) {
-    // Nothing to scan: fall back to the readings screen rather than a blank one.
-    Serial.println("QR generation failed");
     displayResume();
   }
 }
 
-// Hand the screen back to the readings layout once setup is finished.
 void displayResume() {
   screenLocked = false;
   screenUnlockAt = 0;
-  // Pick up a rotation chosen in the portal here rather than at the next boot:
-  // finishing setup is the moment a full redraw happens anyway, so the student
-  // sees the setting take effect instead of wondering whether it saved.
+
   gfx->setRotation(settings.lcdRotation & 0x03);
-  drawStaticUI();
-  drawConnStatus();
+  lastPageChange = millis();
+  forceClockRedraw = true;
+  forceCardRedraw = true;
+  lastDrawnMinute = -1;
+  drawFullPage();
 }
 
-#else  // ---- USE_DISPLAY == 0 : stub out the display API -------------------
+#else
 
 void displayInit() {}
 void displayStatus(const char *, uint16_t) {}
